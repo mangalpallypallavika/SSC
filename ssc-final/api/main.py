@@ -1,232 +1,128 @@
-"""FastAPI Application - SSC Exam Scheduler Multi-Agent API"""
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-from typing import Optional, List
-import json
-import os
-import uuid
-from datetime import datetime
+"""
+api/main.py  —  FastAPI application entry point
+Exposes the orchestrator as REST endpoints + health check.
+Deploy this container to Cloud Run.
+"""
 
-from agents.orchestrator import orchestrate
-from agents.task_agent import TaskAgent
-from agents.schedule_agent import ScheduleAgent
-from agents.notes_agent import NotesAgent
-from agents.youtube_agent import YouTubeAgent
-from db.database import Database
+import asyncio
+import logging
+import os
+from contextlib import asynccontextmanager
+from typing import Any, Dict, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from mcp_servers.mcp_connect import MCPClient, MCPServerConfig, MCPServerType
+from agents.orchestrator import OrchestratorAgent
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
+# ──────────────────────────────────────────────
+#  Startup / shutdown
+# ──────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Build MCP client from env vars (Cloud Run sets these)
+    servers = [
+        MCPServerConfig(
+            MCPServerType.CALENDAR,
+            os.getenv("CALENDAR_MCP_HOST", "localhost"),
+            int(os.getenv("CALENDAR_MCP_PORT", "8001")),
+            api_key=os.getenv("CALENDAR_MCP_KEY"),
+        ),
+        MCPServerConfig(
+            MCPServerType.TASK_MANAGER,
+            os.getenv("TASK_MCP_HOST", "localhost"),
+            int(os.getenv("TASK_MCP_PORT", "8002")),
+            api_key=os.getenv("TASK_MCP_KEY"),
+        ),
+        MCPServerConfig(
+            MCPServerType.NOTES,
+            os.getenv("NOTES_MCP_HOST", "localhost"),
+            int(os.getenv("NOTES_MCP_PORT", "8003")),
+            api_key=os.getenv("NOTES_MCP_KEY"),
+        ),
+        MCPServerConfig(
+            MCPServerType.DATABASE,
+            os.getenv("DB_MCP_HOST", "localhost"),
+            int(os.getenv("DB_MCP_PORT", "8004")),
+            api_key=os.getenv("DB_MCP_KEY"),
+        ),
+    ]
+
+    mcp = MCPClient(servers)
+    await mcp.connect_all()
+    logger.info("MCP tools available: %s", mcp.list_tools())
+
+    app.state.orchestrator = OrchestratorAgent(mcp)
+    logger.info("Orchestrator ready.")
+
+    yield
+    # cleanup if needed
+
 
 app = FastAPI(
-    title="SSC Exam Scheduler - Multi-Agent AI System",
-    description="AI-powered SSC exam preparation platform with multi-agent coordination",
-    version="1.0.0"
+    title="Multi-Agent AI System",
+    description="Manages tasks, schedules, and information via ADK + MCP",
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
 
-db = Database()
-
-# ─── Request/Response Models ──────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+#  Request / Response schemas
+# ──────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
     message: str
-    session_id: Optional[str] = None
-    conversation_history: Optional[List[dict]] = None
+    session_id: Optional[str] = "default"
 
-class TaskCreate(BaseModel):
-    title: str
-    subject: Optional[str] = "General"
-    priority: Optional[str] = "medium"
-    due_date: Optional[str] = None
-    description: Optional[str] = ""
 
-class ExamCreate(BaseModel):
-    exam_name: str
-    exam_date: str
-    tier: Optional[str] = "Tier-1"
-    subjects: Optional[List[str]] = None
-    notes: Optional[str] = ""
+class ChatResponse(BaseModel):
+    message: str
+    agent:   Optional[str] = None
+    intent:  Optional[str] = None
+    data:    Optional[Dict[str, Any]] = None
 
-class NoteCreate(BaseModel):
-    title: str
-    content: str
-    subject: Optional[str] = "General"
-    topic: Optional[str] = ""
-    is_important: Optional[bool] = False
 
-class YouTubeLinkCreate(BaseModel):
-    title: str
-    url: str
-    subject: Optional[str] = "General"
-    topic: Optional[str] = ""
-    channel: Optional[str] = ""
-
-class DailyPlanRequest(BaseModel):
-    study_mode: Optional[str] = "moderate"
-    start_date: Optional[str] = None
-    days: Optional[int] = 7
-    subjects: Optional[List[str]] = None
-
-# ─── Chat Endpoint (Main AI Interface) ───────────────────────────────────────
-
-@app.post("/api/chat")
-async def chat(request: ChatRequest):
-    """Primary AI chat endpoint - routes through multi-agent orchestrator"""
-    try:
-        history = request.conversation_history or []
-        result = orchestrate(request.message, history)
-        
-        # Save conversation
-        session_id = request.session_id or str(uuid.uuid4())[:8]
-        db.update("conversations", session_id, {
-            "messages": json.dumps(result["conversation_history"][-10:]),
-            "updated_at": datetime.now().isoformat()
-        }) if db.get_by_id("conversations", session_id) else db.insert("conversations", {
-            "session_id": session_id,
-            "messages": json.dumps(result["conversation_history"][-10:]),
-            "created_at": datetime.now().isoformat(),
-            "updated_at": datetime.now().isoformat()
-        })
-        
-        return {
-            "response": result["response"],
-            "session_id": session_id,
-            "conversation_history": result["conversation_history"]
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-# ─── Tasks API ────────────────────────────────────────────────────────────────
-
-@app.get("/api/tasks")
-async def list_tasks(subject: Optional[str] = None, status: Optional[str] = None):
-    agent = TaskAgent(db)
-    filters = {}
-    if subject: filters["subject"] = subject
-    if status: filters["status"] = status
-    return agent.handle("list_tasks", filters)
-
-@app.post("/api/tasks")
-async def create_task(task: TaskCreate):
-    agent = TaskAgent(db)
-    return agent.handle("create_task", task.model_dump())
-
-@app.patch("/api/tasks/{task_id}/complete")
-async def complete_task(task_id: str):
-    agent = TaskAgent(db)
-    return agent.handle("complete_task", {"task_id": task_id})
-
-@app.patch("/api/tasks/{task_id}")
-async def update_task(task_id: str, updates: dict):
-    agent = TaskAgent(db)
-    return agent.handle("update_task", {"task_id": task_id, **updates})
-
-@app.get("/api/tasks/stats")
-async def task_stats():
-    agent = TaskAgent(db)
-    return agent.handle("get_stats", {})
-
-# ─── Schedule / Exam API ──────────────────────────────────────────────────────
-
-@app.get("/api/exams")
-async def get_exams():
-    agent = ScheduleAgent(db)
-    return agent.handle("get_schedule", {})
-
-@app.post("/api/exams")
-async def create_exam(exam: ExamCreate):
-    agent = ScheduleAgent(db)
-    return agent.handle("set_exam_date", exam.model_dump())
-
-@app.get("/api/exams/upcoming")
-async def upcoming_exams():
-    agent = ScheduleAgent(db)
-    return agent.handle("get_upcoming", {})
-
-@app.post("/api/schedule/daily-plan")
-async def create_daily_plan(req: DailyPlanRequest):
-    agent = ScheduleAgent(db)
-    data = req.model_dump()
-    if not data.get("start_date"):
-        data["start_date"] = datetime.now().strftime("%Y-%m-%d")
-    return agent.handle("create_daily_plan", data)
-
-@app.get("/api/schedule/subject/{subject}")
-async def get_subject_plan(subject: str):
-    agent = ScheduleAgent(db)
-    return agent.handle("get_subject_plan", {"subject": subject})
-
-# ─── Notes API ────────────────────────────────────────────────────────────────
-
-@app.get("/api/notes")
-async def get_notes(subject: Optional[str] = None):
-    agent = NotesAgent(db)
-    return agent.handle("get_notes", {"subject": subject} if subject else {})
-
-@app.post("/api/notes")
-async def create_note(note: NoteCreate):
-    agent = NotesAgent(db)
-    return agent.handle("create_note", note.model_dump())
-
-@app.get("/api/notes/search")
-async def search_notes(q: str):
-    agent = NotesAgent(db)
-    return agent.handle("search_notes", {"query": q})
-
-# ─── YouTube Links API ────────────────────────────────────────────────────────
-
-@app.get("/api/youtube")
-async def get_youtube_links(subject: Optional[str] = None):
-    agent = YouTubeAgent(db)
-    if subject:
-        return agent.handle("get_by_subject", {"subject": subject})
-    return agent.handle("get_links", {})
-
-@app.post("/api/youtube")
-async def save_youtube_link(link: YouTubeLinkCreate):
-    agent = YouTubeAgent(db)
-    return agent.handle("save_link", link.model_dump())
-
-@app.get("/api/youtube/search")
-async def search_youtube(q: str):
-    agent = YouTubeAgent(db)
-    return agent.handle("search_links", {"query": q})
-
-# ─── Health & Info ────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────
+#  Endpoints
+# ──────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "SSC Exam Scheduler", "version": "1.0.0"}
+    return {"status": "ok"}
 
-@app.get("/api/dashboard")
-async def dashboard():
-    """Get dashboard summary data"""
-    task_agent = TaskAgent(db)
-    schedule_agent = ScheduleAgent(db)
-    
-    task_stats = task_agent.handle("get_stats", {})
-    upcoming = schedule_agent.handle("get_upcoming", {})
-    recent_notes = NotesAgent(db).handle("get_notes", {})
-    
-    return {
-        "tasks": task_stats,
-        "upcoming_exams": upcoming["upcoming_exams"][:3],
-        "recent_notes_count": recent_notes["count"],
-        "last_updated": datetime.now().isoformat()
-    }
 
-# Serve frontend
-if os.path.exists("frontend"):
-    app.mount("/static", StaticFiles(directory="frontend/static"), name="static")
+@app.get("/tools")
+async def list_tools():
+    """List all MCP tools discovered at startup."""
+    orch: OrchestratorAgent = app.state.orchestrator
+    return {"tools": orch.mcp.list_tools()}
 
-@app.get("/")
-async def serve_frontend():
-    if os.path.exists("frontend/index.html"):
-        return FileResponse("frontend/index.html")
-    return {"message": "SSC Exam Scheduler API", "docs": "/docs"}
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat(req: ChatRequest):
+    """Send a natural-language message to the orchestrator."""
+    orch: OrchestratorAgent = app.state.orchestrator
+    try:
+        result = await orch.handle(req.message)
+        return ChatResponse(**result)
+    except Exception as exc:
+        logger.exception("Orchestrator error")
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/agent/{agent_name}/{intent}")
+async def direct_invoke(agent_name: str, intent: str, params: Dict[str, Any] = {}):
+    """Directly invoke a sub-agent by name + intent (for testing)."""
+    orch: OrchestratorAgent = app.state.orchestrator
+    agent = orch._agents.get(agent_name)
+    if not agent:
+        raise HTTPException(404, f"Agent '{agent_name}' not found")
+    result = await agent.run(intent, params)
+    return {"agent": agent_name, "intent": intent, "result": result}
